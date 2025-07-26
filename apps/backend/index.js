@@ -18,7 +18,9 @@ if (typeof globalThis.File === 'undefined') {
 }
 
 const app = express();
-const port = process.env.PORT || 3000;
+// Allow Railway or other hosts to provide a PORT env variable while
+// still defaulting to 3000 for local development.
+const PORT = process.env.PORT || 3000;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ffprobePath = ffprobe.path || ffprobe;
@@ -466,6 +468,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
