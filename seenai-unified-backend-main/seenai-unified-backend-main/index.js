@@ -1,0 +1,471 @@
+import express from 'express';
+import multer from 'multer';
+import dotenv from 'dotenv';
+import OpenAI from 'openai';
+import { File as NodeFile } from 'node:buffer';
+import { spawn } from 'child_process';
+import ffmpegPath from 'ffmpeg-static';
+import ffprobe from 'ffprobe-static';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { YIN } from 'pitchfinder';
+
+dotenv.config();
+
+if (typeof globalThis.File === 'undefined') {
+  globalThis.File = NodeFile;
+}
+
+const app = express();
+const port = process.env.PORT || 3000;
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const ffprobePath = ffprobe.path || ffprobe;
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+async function analyzeTranscript(transcript, metrics = {}) {
+  const metricParts = [];
+  if (metrics.wpm) metricParts.push(`words per minute: ${metrics.wpm}`);
+  if (typeof metrics.pitch !== 'undefined') metricParts.push(`pitch: ${metrics.pitch}`);
+  if (typeof metrics.pitch_variation !== 'undefined')
+    metricParts.push(`pitch variation: ${metrics.pitch_variation}`);
+  if (metrics.filler_word_total !== undefined)
+    metricParts.push(`filler words: ${metrics.filler_word_total}`);
+  if (metrics.energy_score !== undefined)
+    metricParts.push(`energy score: ${metrics.energy_score}`);
+  if (metrics.disfluency_score !== undefined)
+    metricParts.push(`disfluency score: ${metrics.disfluency_score}`);
+  if (metrics.repetition_score !== undefined)
+    metricParts.push(`repetition score: ${metrics.repetition_score}`);
+  if (metrics.cadence_score !== undefined)
+    metricParts.push(`cadence score: ${metrics.cadence_score}`);
+  const metricInfo = metricParts.length ? `\n\nMetrics: ${metricParts.join(', ')}` : '';
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: `You are an expert communication coach analyzing a speaker's performance.
+
+Your goal is to provide deeply personalized and actionable feedback—not generic advice.
+Use the provided transcript and vocal metrics to:
+
+1. Identify any **repetitive phrases** (e.g., "you know," "literally") and explain how repetition affected clarity, energy, or credibility. Suggest better alternatives.
+2. Highlight **disfluencies** (choppy phrasing, sentence restarts, awkward transitions) and recommend how to improve flow. Quote exact lines where it occurred and offer rewritten versions.
+3. Evaluate **tone and energy**: Was the tone appropriate for the speaker's message? Suggest changes in pacing, volume, or pitch at specific moments.
+4. Judge **authenticity**: Did the speaker feel genuine and confident? If not, explain what made it feel off and how they can sound more compelling.
+
+Always quote examples from the actual transcript. Tie all feedback to how the delivery would be perceived by the audience emotionally and rhetorically.
+
+Provide your output as a JSON object with the following keys:
+- "summary": A one-paragraph breakdown of the overall delivery
+- "tone": A short descriptive tone label (e.g., "Motivational and Raw")
+- "tone_rating": A number from 1–10 (average is 5, reserve 9–10 for rare excellence)
+- "tone_explanation": A sentence or two explaining what determined the score
+- "feedback": Specific, high-quality coaching advice following the four points above.`
+      },
+      { role: 'user', content: transcript + metricInfo }
+    ]
+  });
+
+  try {
+    return JSON.parse(completion.choices[0].message.content);
+  } catch (err) {
+    // Fallback if parsing fails
+    return {
+      summary: completion.choices[0].message.content.trim(),
+      tone: '',
+      tone_rating: null,
+      tone_explanation: '',
+      feedback: ''
+    };
+  }
+}
+
+async function detectPitch(buffer) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath || 'ffmpeg', [
+      '-i', 'pipe:0',
+      '-f', 's16le',
+      '-ac', '1',
+      '-ar', '44100',
+      'pipe:1'
+    ]);
+
+    const pcmChunks = [];
+    ff.stdout.on('data', c => pcmChunks.push(c));
+    ff.on('error', reject);
+    ff.on('close', code => {
+      if (code !== 0) {
+        return reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+      const pcm = Buffer.concat(pcmChunks);
+      const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+      const yin = YIN({ sampleRate: 44100 });
+      const frameSize = 2048;
+      const pitches = [];
+      for (let i = 0; i + frameSize <= samples.length; i += frameSize) {
+        const frame = Array.from(samples.subarray(i, i + frameSize));
+        const freq = yin(frame);
+        if (freq) pitches.push(freq);
+      }
+      if (!pitches.length) return resolve(null);
+      pitches.sort((a, b) => a - b);
+      const median = pitches[Math.floor(pitches.length / 2)];
+      const mean = pitches.reduce((s, p) => s + p, 0) / pitches.length;
+      const variance = pitches.reduce((s, p) => s + (p - mean) ** 2, 0) / pitches.length;
+      const std = Math.sqrt(variance);
+      resolve({
+        median: +median.toFixed(2),
+        variation: +std.toFixed(2)
+      });
+    });
+    ff.stdin.end(buffer);
+  });
+}
+
+function countFillerWords(transcript) {
+  const tokens = transcript.toLowerCase().split(/\s+/);
+  const breakdown = {};
+  let total = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const word = tokens[i];
+    if (word === 'like') {
+      const next = tokens[i + 1] || '';
+      if (
+        ['to', 'a', 'an', 'the', 'my', 'your', 'his', 'her', 'our', 'their', 'this', 'that', 'these', 'those'].includes(
+          next
+        )
+      ) {
+        continue;
+      }
+    }
+    if (word === 'you' && tokens[i + 1] === 'know') {
+      breakdown['you know'] = (breakdown['you know'] || 0) + 1;
+      total++;
+      i++;
+      continue;
+    }
+    if (word === 'i' && tokens[i + 1] === 'mean') {
+      breakdown['i mean'] = (breakdown['i mean'] || 0) + 1;
+      total++;
+      i++;
+      continue;
+    }
+    if (['um', 'uh', 'like', 'basically'].includes(word)) {
+      breakdown[word] = (breakdown[word] || 0) + 1;
+      total++;
+    }
+  }
+  return { total, breakdown };
+}
+
+function detectRepetitions(transcript) {
+  const tokens = transcript.toLowerCase().split(/\s+/);
+  const counts = {};
+  for (let n = 2; n <= 5; n++) {
+    for (let i = 0; i + n <= tokens.length; i++) {
+      const phrase = tokens.slice(i, i + n).join(' ');
+      counts[phrase] = (counts[phrase] || 0) + 1;
+    }
+  }
+
+  const repeated = Object.keys(counts)
+    .filter(p => counts[p] > 1)
+    .sort((a, b) => b.split(' ').length - a.split(' ').length);
+
+  const phrases = [];
+  for (const phrase of repeated) {
+    if (!phrases.some(longer => longer.includes(phrase))) {
+      phrases.push(phrase);
+    }
+  }
+
+  return { phrases, score: phrases.length };
+}
+
+async function getRawMetrics(transcript, segments = [], audioBuffer) {
+  const words = transcript.trim().split(/\s+/);
+  const { total: filler_word_total, breakdown: filler_word_breakdown } = countFillerWords(transcript);
+
+  let wpm = 0;
+  if (segments.length > 0) {
+    const duration = segments[segments.length - 1].end - segments[0].start;
+    if (duration > 0) {
+      wpm = +(words.length / (duration / 60)).toFixed(2);
+    }
+  }
+
+  let pitchInfo = null;
+  if (audioBuffer) {
+    try {
+      pitchInfo = await detectPitch(audioBuffer);
+    } catch (err) {
+      console.error('Pitch detection error:', err);
+    }
+  }
+
+  const { phrases: repetitive_phrases, score: repetition_score } = detectRepetitions(transcript);
+
+  const pitch = pitchInfo ? pitchInfo.median : null;
+  const pitch_variation = pitchInfo ? pitchInfo.variation : null;
+
+  const wpmNorm = Math.min(1, wpm / 160);
+  const pitchVarNorm = Math.min(1, (pitch_variation || 0) / 60);
+  const energy_score = Math.round(((wpmNorm + pitchVarNorm) / 2) * 10);
+  const energy_label =
+    energy_score > 7 ? 'High' : energy_score >= 4 ? 'Moderate' : 'Low';
+
+  const fillerRatio = filler_word_total / words.length;
+  const sentences = transcript.split(/[.!?]+/).filter(Boolean);
+  const avgSentenceLength = words.length / (sentences.length || 1);
+  let disfluency_score = 10;
+  disfluency_score -= Math.min(5, fillerRatio * 50);
+  disfluency_score -= Math.min(3, repetition_score);
+  if (avgSentenceLength > 20 || avgSentenceLength < 5) disfluency_score -= 2;
+  disfluency_score = Math.max(1, Math.round(disfluency_score));
+  const disfluency_label =
+    disfluency_score > 7 ? 'Smooth' : disfluency_score >= 4 ? 'Somewhat Choppy' : 'Very Choppy';
+
+  // Cadence score based on pause consistency, WPM and filler usage
+  let avgGap = 0;
+  let gapStd = 0;
+  if (segments.length > 1) {
+    const gaps = [];
+    for (let i = 0; i < segments.length - 1; i++) {
+      const gap = segments[i + 1].start - segments[i].end;
+      if (gap > 0) gaps.push(gap);
+    }
+    if (gaps.length) {
+      avgGap = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+      const mean = avgGap;
+      const variance = gaps.reduce((s, g) => s + (g - mean) ** 2, 0) / gaps.length;
+      gapStd = Math.sqrt(variance);
+    }
+  }
+  let cadence_score = 10;
+  cadence_score -= Math.min(3, avgGap * 3);
+  cadence_score -= Math.min(2, gapStd * 2);
+  cadence_score -= Math.min(3, Math.abs(wpm - 150) / 50);
+  cadence_score -= Math.min(2, fillerRatio * 10);
+  cadence_score = Math.max(1, Math.round(cadence_score));
+  const cadence_description =
+    cadence_score > 8
+      ? 'Very Smooth'
+      : cadence_score >= 6
+      ? 'Smooth'
+      : cadence_score >= 4
+      ? 'Uneven'
+      : 'Choppy';
+
+  return {
+    wpm,
+    pitch: pitch ?? 'N/A',
+    pitch_variation: pitch_variation ?? 'N/A',
+    filler_words: filler_word_total,
+    filler_word_total,
+    filler_word_breakdown,
+    repetitive_phrases,
+    repetition_score,
+    energy_score,
+    energy_label,
+    disfluency_score,
+    disfluency_label,
+    cadence_score,
+    cadence_description
+  };
+}
+
+function formatTimestamp(seconds) {
+  const date = new Date(seconds * 1000).toISOString().slice(11, 23);
+  return date;
+}
+
+async function scoreSegments(segments) {
+  const scored = [];
+  for (const seg of segments) {
+    let score = 0;
+    try {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'user',
+            content:
+              'On a scale of 1 to 10, how emotionally intense is the following sentence? Just return a number.\n"' +
+              seg.text +
+              '"'
+          }
+        ]
+      });
+      const txt = completion.choices[0].message.content.trim();
+      const num = parseFloat(txt);
+      if (!Number.isNaN(num)) score = Math.round(num);
+    } catch (err) {
+      console.error('Intensity score error:', err);
+    }
+    scored.push({ ...seg, intensityScore: score });
+  }
+  return scored;
+}
+
+async function hasVideoStream(filePath) {
+  return new Promise(resolve => {
+    const ff = spawn(ffprobePath, [
+      '-v',
+      'error',
+      '-select_streams',
+      'v',
+      '-show_entries',
+      'stream=index',
+      '-of',
+      'csv=p=0',
+      filePath
+    ]);
+    let out = '';
+    ff.stdout.on('data', d => (out += d));
+    ff.on('close', () => {
+      resolve(out.trim().length > 0);
+    });
+    ff.on('error', () => resolve(false));
+  });
+}
+
+async function extractFrame(input, timestamp, outPath) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath || 'ffmpeg', [
+      '-ss',
+      timestamp,
+      '-i',
+      input,
+      '-frames:v',
+      '1',
+      '-q:v',
+      '2',
+      '-s',
+      '480x270',
+      outPath
+    ]);
+    ff.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error('ffmpeg exited with code ' + code));
+    });
+    ff.on('error', reject);
+  });
+}
+
+app.post('/analyze', upload.single('video'), async (req, res, next) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No video file provided' });
+  }
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'analyze-'));
+  const inputPath = path.join(tmpDir, req.file.originalname);
+  await fs.writeFile(inputPath, req.file.buffer);
+
+  const result = {
+    transcript: null,
+    summary: null,
+    tone: null,
+    tone_rating: null,
+    tone_explanation: null,
+    raw_metrics: null,
+    feedback: null,
+    frames: []
+  };
+
+  let segments = [];
+  try {
+    const file = await OpenAI.toFile(req.file.buffer, req.file.originalname);
+    const transcription = await openai.audio.transcriptions.create({
+      file,
+      model: 'whisper-1',
+      response_format: 'verbose_json'
+    });
+    result.transcript = transcription.text;
+    segments = transcription.segments || [];
+  } catch (err) {
+    console.error('Transcription error:', err);
+  }
+
+  if (result.transcript) {
+    try {
+      result.raw_metrics = await getRawMetrics(
+        result.transcript,
+        segments,
+        req.file.buffer
+      );
+    } catch (err) {
+      console.error('Metrics calculation error:', err);
+    }
+
+    try {
+      const analysis = await analyzeTranscript(result.transcript, result.raw_metrics);
+      result.summary = analysis.summary;
+      result.tone = analysis.tone;
+      result.tone_rating = analysis.tone_rating;
+      result.tone_explanation = analysis.tone_explanation;
+      result.feedback = analysis.feedback;
+    } catch (err) {
+      console.error('Tone analysis error:', err);
+    }
+  }
+
+  if (!result.transcript) {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    return next(new Error('Failed to transcribe video'));
+  }
+
+  // Emotion scoring and frame extraction
+  let scoredSegments = [];
+  if (segments.length) {
+    scoredSegments = await scoreSegments(segments);
+    scoredSegments.sort((a, b) => b.intensityScore - a.intensityScore);
+  }
+
+  const unique = [];
+  for (const seg of scoredSegments) {
+    if (!unique.some(u => Math.abs(u.start - seg.start) <= 1.5)) {
+      unique.push(seg);
+    }
+    if (unique.length >= 10) break;
+  }
+
+  if (await hasVideoStream(inputPath)) {
+    for (let i = 0; i < unique.length; i++) {
+      const seg = unique[i];
+      const ts = seg.start.toFixed(3);
+      const outPath = path.join(tmpDir, `frame_${i}.jpg`);
+      try {
+        await extractFrame(inputPath, ts, outPath);
+        const data = await fs.readFile(outPath);
+        result.frames.push({
+          timestamp: formatTimestamp(seg.start),
+          score: seg.intensityScore,
+          image: 'data:image/jpeg;base64,' + data.toString('base64')
+        });
+      } catch (err) {
+        console.error('Frame extraction error:', err);
+      }
+    }
+  } else {
+    result.note = 'No video stream found, frame extraction skipped.';
+  }
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
+
+  res.json(result);
+});
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
+});
