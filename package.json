@@ -1,0 +1,11 @@
+{
+  "name": "seenai-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "pnpm -r --parallel dev"
+  }
+}
