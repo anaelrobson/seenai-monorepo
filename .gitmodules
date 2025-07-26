@@ -1,6 +1,0 @@
-[submodule "packages/seenai-dashboard"]
-	path = packages/seenai-dashboard
-	url = https://github.com/anaelrobson/seenai-dashboard.git
-[submodule "packages/seenai-unified-backend"]
-	path = packages/seenai-unified-backend
-	url = https://github.com/anaelrobson/seenai-unified-backend.git
