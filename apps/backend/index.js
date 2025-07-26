@@ -360,6 +360,10 @@ async function extractFrame(input, timestamp, outPath) {
   });
 }
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 app.post('/analyze', upload.single('video'), async (req, res, next) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No video file provided' });
