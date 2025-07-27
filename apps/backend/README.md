@@ -3,6 +3,8 @@ codex/build-unified-node.js-express-backend
 
 This Express server provides a single `/analyze` endpoint that accepts a video file and returns a transcript along with a detailed tone analysis report. The tone analysis now offers stricter scoring and a short feedback message to help improve delivery.
 
+The Express application itself lives in `index.js` and is started via `server.js`. Deploy platforms should run `pnpm start` in the `apps/backend` directory.
+
 ## Setup
 
 1. Install dependencies (Node.js 18+)
@@ -19,9 +21,9 @@ This Express server provides a single `/analyze` endpoint that accepts a video f
    ```
 3. Start the server
    ```bash
-   npm start
+   pnpm start
    ```
-
+   
 The server listens on `PORT` from `.env` (defaults to `3000`).
 
 ## Usage
