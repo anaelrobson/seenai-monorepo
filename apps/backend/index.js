@@ -363,6 +363,7 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/analyze', upload.single('video'), async (req, res, next) => {
+  console.log('POST /analyze hit');
   if (!req.file) {
     return res.status(400).json({ error: 'No video file provided' });
   }
